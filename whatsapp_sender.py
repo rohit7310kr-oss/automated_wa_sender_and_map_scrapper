@@ -1,16 +1,40 @@
+import hashlib
 import os
 import random
 import time
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-CSV_FILE = "google_maps_contacts.csv"
-IMAGE_PATH = "banner.jpg"
+# =====================================================================
+# CONFIG: everything you normally change lives here
+# =====================================================================
+CSV_FILE = "collected-data/data.csv"   # contacts file (needs a "Phone Number" column)
+
+IMAGE_USED = True        # False -> text-only messages, no image is attached
+IMAGE_URL = ""           # a web link (https://...) OR a local path like "banner.jpg"
+
+# Placeholders you can use: {name} {phone} {address} {city} {business_type}
+# Use \n for a new line.
+TEXT_TEMPLATE = (
+    "Hello {name}, hope you're doing well! "
+    "I found your store on Google Maps and wanted to share "
+    "this quick overview of our services."
+)
+
+DELAY_MINUTES = 4        # wait between messages
+DELAY_JITTER_SECONDS = 15  # +/- random seconds added to the delay (set 0 for exactly 4:00)
+LIMIT = 25               # max messages sent per run
+
 SESSION_DIR = "./whatsapp_session"
-LIMIT = 25                   # max messages per run
-DELAY_RANGE = (0, 0)       # random seconds between contacts (avoids ban)
 DEFAULT_COUNTRY_CODE = "91"
+IMAGE_CACHE_DIR = Path("./.image_cache")
+
+# Statuses that mean "do not process this row again"
+DONE_STATUSES = ("sent", "invalid", "no_phone", "duplicate")
 
 # Selectors (WhatsApp changes these often; several fallbacks are given)
 MAIN_INPUT = 'footer div[contenteditable="true"]'
@@ -22,6 +46,15 @@ PHOTO_ITEM = ('li:has-text("Photos"), div[role="button"]:has-text("Photos"), '
 PREVIEW_SEND = ('[aria-label="Send"], [data-icon*="send"], '
                 'div[role="dialog"] [role="button"]:has([data-icon*="send"])')
 INVALID_POPUP = 'div[role="dialog"]:has-text("invalid"), div[role="dialog"]:has-text("not on WhatsApp")'
+
+
+# =====================================================================
+# HELPERS
+# =====================================================================
+class SafeDict(dict):
+    """Unknown {placeholders} stay as-is instead of crashing."""
+    def __missing__(self, key):
+        return "{" + key + "}"
 
 
 def clean_phone(raw):
@@ -37,6 +70,65 @@ def clean_phone(raw):
     return digits
 
 
+def value_or_default(row, column, default=""):
+    val = str(row.get(column, "")).strip()
+    return default if val in ("", "N/A", "nan") else val
+
+
+def build_message(row, phone):
+    name = value_or_default(row, "Business Name", "Sir/Ma'am")
+    values = SafeDict(
+        name=name,
+        phone=phone,
+        address=value_or_default(row, "Address"),
+        city=value_or_default(row, "City"),
+        business_type=value_or_default(row, "Business Type"),
+    )
+    try:
+        return TEXT_TEMPLATE.format_map(values)
+    except (ValueError, IndexError):
+        # stray "{" or "}" in the template: send it unchanged rather than crash
+        return TEXT_TEMPLATE
+
+
+def resolve_image():
+    """Return a local image path, downloading IMAGE_URL first if it is a web link."""
+    if not IMAGE_URL:
+        raise SystemExit("IMAGE_USED is True but IMAGE_URL is empty.")
+
+    if IMAGE_URL.lower().startswith(("http://", "https://")):
+        IMAGE_CACHE_DIR.mkdir(exist_ok=True)
+        ext = Path(urlparse(IMAGE_URL).path).suffix or ".jpg"
+        local = IMAGE_CACHE_DIR / (hashlib.md5(IMAGE_URL.encode()).hexdigest() + ext)
+        if not local.exists():
+            print("Downloading image...")
+            req = urllib.request.Request(IMAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                local.write_bytes(resp.read())
+        return str(local.resolve())
+
+    if not os.path.exists(IMAGE_URL):
+        raise SystemExit(f"Image '{IMAGE_URL}' not found.")
+    return os.path.abspath(IMAGE_URL)
+
+
+def save_csv(df):
+    """Write to a temp file then swap, so a crash never leaves a broken CSV."""
+    tmp = CSV_FILE + ".tmp"
+    df.to_csv(tmp, index=False, encoding="utf-8-sig")
+    os.replace(tmp, CSV_FILE)
+
+
+def wait_between_messages():
+    seconds = DELAY_MINUTES * 60 + random.uniform(-DELAY_JITTER_SECONDS, DELAY_JITTER_SECONDS)
+    seconds = max(0, seconds)
+    print(f"  Waiting {seconds / 60:.1f} min before the next message...\n")
+    time.sleep(seconds)
+
+
+# =====================================================================
+# WHATSAPP ACTIONS
+# =====================================================================
 def open_chat(page, phone):
     """Open chat. Returns 'ok', 'invalid' or 'timeout'."""
     page.goto(f"https://web.whatsapp.com/send?phone={phone}")
@@ -54,6 +146,16 @@ def open_chat(page, phone):
     return "timeout"
 
 
+def type_message(page, text):
+    """Type text into the focused box. New lines use Shift+Enter (plain Enter would send)."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            page.keyboard.insert_text(line)
+        if i < len(lines) - 1:
+            page.keyboard.press("Shift+Enter")
+
+
 def attach_image(page, image_path):
     page.locator(ATTACH_BTN).first.click()
     time.sleep(0.8)
@@ -69,9 +171,22 @@ def attach_image(page, image_path):
     page.locator('input[type="file"][accept*="image"]').first.set_input_files(image_path)
 
 
-def outgoing_count(page):
-    """Number of outgoing (sent by me) messages currently in the open chat."""
-    return page.locator('div.message-out, div[class*="message-out"]').count()
+def send_text_only(page, text):
+    box = page.locator(MAIN_INPUT).first
+    box.click()
+    type_message(page, text)
+    time.sleep(0.8)
+    page.keyboard.press("Enter")
+
+    # Sent = the input box is empty again
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        box = page.locator(MAIN_INPUT).first
+        if box.count() > 0 and box.is_visible() and box.inner_text().strip() == "":
+            time.sleep(4)  # let the message leave (clock icon -> tick) before navigating away
+            return
+        time.sleep(0.5)
+    raise Exception("Message not confirmed sent (input still not empty)")
 
 
 def send_image_with_caption(page, image_path, caption):
@@ -83,7 +198,7 @@ def send_image_with_caption(page, image_path, caption):
     time.sleep(2.0)  # let the preview finish rendering
 
     # Caption box is auto-focused in the preview
-    page.keyboard.insert_text(caption)
+    type_message(page, caption)
     time.sleep(0.8)
     page.keyboard.press("Enter")
     time.sleep(1.5)
@@ -96,16 +211,13 @@ def send_image_with_caption(page, image_path, caption):
     except Exception:
         pass
 
-    # Confirm the send. Icon names change between WhatsApp versions, so use
-    # version-proof signals instead: the preview closes AND the number of
-    # outgoing messages in the chat goes up.
+    # Confirm the send: preview closed AND main chat input box is empty
     deadline = time.time() + 40
     confirmed = False
     while time.time() < deadline:
         preview_open = page.locator(PREVIEW_SEND).count() > 0 and \
             page.locator(PREVIEW_SEND).last.is_visible()
         if not preview_open:
-            # Sent = preview closed and the main chat input box is empty
             box = page.locator(MAIN_INPUT).first
             if box.count() > 0 and box.is_visible():
                 if box.inner_text().strip() == "":
@@ -119,29 +231,46 @@ def send_image_with_caption(page, image_path, caption):
     time.sleep(6)
 
 
+# =====================================================================
+# MAIN
+# =====================================================================
 def main():
-    if not os.path.exists(IMAGE_PATH):
-        print(f"Image '{IMAGE_PATH}' not found.")
-        return
+    image_path = resolve_image() if IMAGE_USED else None
 
-    df = pd.read_csv(CSV_FILE, dtype=str)
-    df = df.dropna(subset=["Phone Number"]).drop_duplicates(subset=["Phone Number"])
+    # keep_default_na=False keeps "N/A" as text and empty cells as "" (no NaN surprises)
+    df = pd.read_csv(CSV_FILE, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    if "Phone Number" not in df.columns:
+        raise SystemExit(f"'{CSV_FILE}' has no 'Phone Number' column.")
     if "Status" not in df.columns:
         df["Status"] = ""
-    df["Status"] = df["Status"].fillna("")
 
-    image_path = os.path.abspath(IMAGE_PATH)
+    # Mark rows that can never be sent, WITHOUT deleting them from the file
+    seen_phones = set()
+    for idx, row in df.iterrows():
+        if row["Status"] in DONE_STATUSES:
+            continue
+        phone = clean_phone(row["Phone Number"])
+        if not phone:
+            df.at[idx, "Status"] = "no_phone"
+        elif phone in seen_phones:
+            df.at[idx, "Status"] = "duplicate"
+        else:
+            seen_phones.add(phone)
+    save_csv(df)
 
-    # Show what is in the CSV so a "0 sent" run is never a mystery
     counts = df["Status"].replace("", "pending").value_counts().to_dict()
     print(f"Contacts in CSV: {len(df)} -> {counts}")
-    pending = (~df["Status"].isin(["sent", "invalid"])).sum()
-    if pending == 0:
-        print("Nothing to send: every contact is already marked 'sent' or "
-              "'invalid' in the Status column.\n"
-              "To re-send, clear the Status column (or delete it) in the CSV, "
-              "or add new contacts.")
+
+    pending = [i for i in df.index if df.at[i, "Status"] not in DONE_STATUSES]
+    if not pending:
+        print("Nothing to send: every contact is already done (sent / invalid / no phone / duplicate).\n"
+              "To re-send, clear the Status column in the CSV.")
         return
+
+    to_send = min(len(pending), LIMIT)
+    print(f"Mode: {'image + text' if IMAGE_USED else 'text only'} | "
+          f"will try up to {to_send} message(s) | delay {DELAY_MINUTES} min "
+          f"(about {to_send * DELAY_MINUTES} min total)\n")
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
@@ -164,26 +293,18 @@ def main():
         print("Logged in.\n")
 
         sent = 0
-        for idx, row in df.iterrows():
+        for pos, idx in enumerate(pending):
             if sent >= LIMIT:
                 print(f"Reached limit of {LIMIT}.")
                 break
-            if row["Status"] in ("sent", "invalid"):
-                continue  # resume support
 
-            name = row.get("Business Name") or "Sir/Ma'am"
+            row = df.loc[idx]
+            name = value_or_default(row, "Business Name", "Sir/Ma'am")
             phone = clean_phone(row["Phone Number"])
-            if not phone:
-                print(f"Skipping bad number for {name}: {row['Phone Number']}")
-                df.at[idx, "Status"] = "invalid"
-                df.to_csv(CSV_FILE, index=False)
-                continue
+            message = build_message(row, phone)
 
-            caption = (f"Hello {name}, hope you're doing well! "
-                       f"I found your store on Google Maps and wanted to share "
-                       f"this quick overview of our services.")
-
-            print(f"[{sent + 1}/{LIMIT}] {name} ({phone})")
+            print(f"[{sent + 1}/{to_send}] {name} ({phone})")
+            attempted_send = False   # True once we actually tried to message them
             try:
                 result = open_chat(page, phone)
                 if result == "invalid":
@@ -194,17 +315,27 @@ def main():
                     df.at[idx, "Status"] = "failed"
                 else:
                     time.sleep(random.uniform(1.5, 3))
-                    send_image_with_caption(page, image_path, caption)
+                    attempted_send = True
+                    if IMAGE_USED:
+                        send_image_with_caption(page, image_path, message)
+                    else:
+                        send_text_only(page, message)
                     df.at[idx, "Status"] = "sent"
                     sent += 1
-                    print("  Sent.\n")
+                    print("  Sent.")
             except Exception as e:
-                print(f"  Failed: {e}\n")
+                print(f"  Failed: {e}")
                 df.at[idx, "Status"] = "failed"
                 page.screenshot(path=f"error_{idx}.png")
 
-            df.to_csv(CSV_FILE, index=False)  # save progress after every contact
-            time.sleep(random.uniform(*DELAY_RANGE))
+            save_csv(df)  # save progress after every contact
+
+            # Delay only after a real send attempt, and not after the last one
+            is_last = pos == len(pending) - 1
+            if attempted_send and not is_last and sent < LIMIT:
+                wait_between_messages()
+            else:
+                print()
 
         print(f"Done. Sent {sent} messages.")
         ctx.close()
