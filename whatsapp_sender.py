@@ -14,18 +14,14 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # =====================================================================
 CSV_FILE = "collected-data/data.csv"   # contacts file (needs a "Phone Number" column)
 
-IMAGE_USED = True        # False -> text-only messages, no image is attached
+IMAGE_USED = False        # False -> text-only messages, no image is attached
 IMAGE_URL = ""           # a web link (https://...) OR a local path like "banner.jpg"
 
 # Placeholders you can use: {name} {phone} {address} {city} {business_type}
 # Use \n for a new line.
-TEXT_TEMPLATE = (
-    "Hello {name}, hope you're doing well! "
-    "I found your store on Google Maps and wanted to share "
-    "this quick overview of our services."
-)
+TEXT_TEMPLATE = "Hello {name} Sir, I\'m Sanjay, Founder of Soseeks India Private Limited. \n We\'ve built *Chat2Bill*, a smart billing and GST solution for retail businesses such as grocery stores, supermarkets, electronics shops, pharmacies, and jewellery stores.\n I'd like to explore whether Chat2Bill could be useful for your retail clients and discuss potential collaboration opportunities.\n Would you be available for a quick 10–15 minute discussion? I can share a brief demo if you\'re interested.\n Thank you!"
 
-DELAY_MINUTES = 4        # wait between messages
+DELAY_MINUTES = 0       # wait between messages
 DELAY_JITTER_SECONDS = 15  # +/- random seconds added to the delay (set 0 for exactly 4:00)
 LIMIT = 25               # max messages sent per run
 
